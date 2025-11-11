@@ -41,73 +41,52 @@ export function CertificateForm() {
     },
   })
 
-  async function onSubmit(values: z.infer<typeof formSchema>) {
+  const onSubmit = async (values: z.infer<typeof formSchema>) => {
     try {
       setIsGenerating(true);
       console.log("Submitting form with values:", values);
 
-      // const response = await verifyAndGenerateCertificate(values);
       const response = await fetch("/api/verify-and-generate", {
-      method: "POST",
-      body: JSON.stringify(values),
-      headers: { "Content-Type": "application/json" }
-    }).then(res => res.json());
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(values),
+      });
 
+      const data = await response.json();
 
-      console.log("Verification response:", response);
-
-      if (!response.success) {
+      if (!response.ok || !data.success) {
+        // Show error message
         toast({
-          title: "Verification Failed",
-          description: `${response.message}. Please check if your email matches your registration. Contact us if you need help.`,
+          title: "Error",
+          description: data.message || "Participant details not found in registered list",
           variant: "destructive",
         });
         return;
       }
 
-      if (!response.data) {
-        throw new Error("No certificate data received");
-      }
-
-      // Convert base64 to Uint8Array first
-      const binaryString = window.atob(response.data);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-
-      // Create blob from Uint8Array
-      const pdfBlob = new Blob([bytes], { type: "application/pdf" });
-
-      // Create download link
-      const url = window.URL.createObjectURL(pdfBlob);
-      
-      // Option 1: Direct download
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `Certificate_${values.name}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-
-      // Option 2: Open in new tab (add this if you want preview option)
-      window.open(url, '_blank');
-
-      // Cleanup
-      window.URL.revokeObjectURL(url);
-      a.remove();
-
+      // Success - show success message
       toast({
-        title: "Certificate Generated",
-        description: "Your certificate has been generated. Check your downloads folder.",
+        title: "Success! 🎉",
+        description: "Your certificate has been generated successfully!",
+        variant: "default",
       });
 
+      // Download the certificate
+      const link = document.createElement("a");
+      link.href = `data:application/pdf;base64,${data.data}`;
+      link.download = `${values.name.replace(/\s+/g, "_")}_Certificate.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      // Reset form
       form.reset();
+
     } catch (error) {
-      console.error("Error generating certificate:", error);
+      console.error("Submission error:", error);
       toast({
         title: "Error",
-        description: error instanceof Error ? error.message : "Failed to generate certificate contact us for help.",
+        description: "An unexpected error occurred. Please try again.",
         variant: "destructive",
       });
     } finally {

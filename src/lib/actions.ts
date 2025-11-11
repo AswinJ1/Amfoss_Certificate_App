@@ -2,10 +2,37 @@
 
 import { promises as fs } from "fs"
 import path from "path"
-import { email, z } from "zod"
+import { z } from "zod"
 import { PDFDocument, rgb } from 'pdf-lib'
 import * as XLSX from "xlsx"
 import fontkit from '@pdf-lib/fontkit'
+import { prisma } from './prisma'
+
+// Cache for participants data
+let participantsCache: any[] | null = null;
+let cacheTimestamp: number = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+async function getParticipants(): Promise<any[]> {
+  const now = Date.now();
+  
+  // Return cached data if still valid
+  if (participantsCache && (now - cacheTimestamp) < CACHE_DURATION) {
+    console.log("Using cached participants data");
+    return participantsCache;
+  }
+  
+  // Load fresh data
+  console.log("Loading participants from Excel");
+  const filePath = path.resolve(process.cwd(), "data", "students.xlsx");
+  const fileBuffer = await fs.readFile(filePath);
+  const workbook = XLSX.read(fileBuffer, { type: "buffer" });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  participantsCache = XLSX.utils.sheet_to_json(sheet);
+  cacheTimestamp = now;
+  
+  return participantsCache;
+}
 
 const formSchema = z.object({
   name: z.string().min(1, "Full name is required"),
@@ -26,45 +53,18 @@ export async function verifyAndGenerateCertificate(data: {
   email: string;
 }): Promise<ActionResponse> {
   try {
-    // Log inputs for debugging
-    console.log("Verifying participant with details:", {
-      name: data.name,
-      rollno: data.rollno,
-      email: data.email
-    });
+    console.log("Verifying participant:", data);
 
-    // Check file paths and existence before proceeding
+    // Remove redundant file access checks - only check once
     const templatePath = path.resolve(process.cwd(), "public", "certificate-template.pdf");
     const fontPath = path.resolve(process.cwd(), 'public', 'fonts', 'Acumin-RPro.otf');
-    const excelPath = path.resolve(process.cwd(), "data", "students.xlsx");
-    
-    console.log("Checking paths:", {
-      templatePath,
-      fontPath,
-      excelPath
-    });
 
-    // Check if files exist
-    try {
-      await fs.access(templatePath);
-      await fs.access(fontPath);
-      await fs.access(excelPath);
-      console.log("All required files exist");
-    } catch (error) {
-      console.error("File access error:", error);
-      return {
-        success: false,
-        message: `File not found: ${(error as Error).message}`
-      };
-    }
-
+    // Verify participant using cached data
     const isValidParticipant = await verifyParticipant(
       data.name,
       data.rollno,  
       data.email
     );
-    
-    console.log("Full verification response:", { success: isValidParticipant });
     
     if (!isValidParticipant) {
       return {
@@ -74,8 +74,10 @@ export async function verifyAndGenerateCertificate(data: {
     }
 
     // Read and modify PDF
-    const templateBytes = await fs.readFile(templatePath);
-    const fontBytes = await fs.readFile(fontPath);
+    const [templateBytes, fontBytes] = await Promise.all([
+      fs.readFile(templatePath),
+      fs.readFile(fontPath)
+    ]);
 
     const pdfDoc = await PDFDocument.load(templateBytes);
     pdfDoc.registerFontkit(fontkit);
@@ -83,40 +85,48 @@ export async function verifyAndGenerateCertificate(data: {
     const page = pdfDoc.getPages()[0];
     const { width, height } = page.getSize();
     
-    // Text configurations based on example certificate
-    // Name goes below "This certificate is presented to"
+    // Proper case formatting for the name
+    const formatName = (name: string) => {
+      return name
+        .trim()
+        .split(' ')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+        .join(' ');
+    };
+    
+    const formattedName = formatName(data.name);
+    
+    // Dynamic font size calculation
+    const maxNameWidth = width * 0.7;
+    let nameFontSize = 45;
+    let nameWidth = font.widthOfTextAtSize(formattedName, nameFontSize);
+    
+    while (nameWidth > maxNameWidth && nameFontSize > 20) {
+      nameFontSize -= 1;
+      nameWidth = font.widthOfTextAtSize(formattedName, nameFontSize);
+    }
+    
     const nameConfig = {
-      text: data.name,
-      fontSize: 50,
-      y: height * 0.45,  // Lowered the name position
-      fontStyle: 'bold',
+      text: formattedName,
+      fontSize: nameFontSize,
+      y: height * 0.48,
+      xOffset: 100
     };
 
-
-   
-    // Team/Project ID below "titled:"
-
-
-    // Function to center and draw text
-    const drawCenteredText = (config: { text: string, fontSize: number, y: number }) => {
+    const drawCenteredText = (config: { text: string, fontSize: number, y: number, xOffset?: number }) => {
       const textWidth = font.widthOfTextAtSize(config.text, config.fontSize);
-      const x = (width - textWidth) / 2;
+      const x = (width - textWidth) / 2 + (config.xOffset || 0);
       
       page.drawText(config.text, {
         x,
         y: config.y,
         size: config.fontSize,
         font,
-        color: rgb(0,0,0)
+        color: rgb(0, 0, 0)
       });
     };
 
-    // Draw all text elements
     drawCenteredText(nameConfig);
-    // drawCenteredText(rollNoConfig);
-    // drawCenteredText(teamNoConfig);
- 
-    
 
     const modifiedPdfBytes = await pdfDoc.save();
     const base64PDF = Buffer.from(modifiedPdfBytes).toString('base64');
@@ -138,24 +148,38 @@ export async function verifyAndGenerateCertificate(data: {
 
 async function verifyParticipant(name: string, rollno: string, email: string): Promise<boolean> {
   try {
-    console.log("Verifying participant with:", { name, rollno, email });
-
-    const filePath = path.resolve(process.cwd(),"data","students.xlsx");
-    const fileBuffer = await fs.readFile(filePath);
-    const workbook = XLSX.read(fileBuffer, { type: "buffer" });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const participants = XLSX.utils.sheet_to_json(sheet);
-    console.log("Excel columns:", Object.keys(participants[0] || {}));
-    console.log("Participants data:", participants);
-
+    const participants = await getParticipants();
+    
+    const normalizeName = (str: string) => str.trim().toLowerCase().replace(/\s+/g, ' ');
+    const normalizeEmail = (str: string) => str.trim().toLowerCase();
+    
     const found = participants.some((p: any) => {
-      const matchName = p.name?.toString().trim().toLowerCase() === name.trim().toLowerCase();
+      const matchName = normalizeName(p.name?.toString() || '') === normalizeName(name);
       const matchRollNo = p.rollno?.toString().trim().toLowerCase() === rollno.trim().toLowerCase();
-      console.log("Matching row:", { p, matchName, matchRollNo});
-      return matchName && matchRollNo ;
+      const matchEmail = normalizeEmail(p.email?.toString() || '') === normalizeEmail(email);
+      
+      // All three must match
+      const isMatch = matchName && matchRollNo && matchEmail;
+      
+      // Log matching attempts for debugging
+      if (matchName && matchRollNo && !matchEmail) {
+        console.log("⚠️ Name and Roll No match but email doesn't:", {
+          excelEmail: p.email,
+          inputEmail: email
+        });
+      }
+      
+      if (isMatch) {
+        console.log("✅ Participant verified:", { name: p.name, rollno: p.rollno, email: p.email });
+      }
+      
+      return isMatch;
     });
 
-    console.log("Participant found:", found);
+    if (!found) {
+      console.log("❌ No matching participant found for:", { name, rollno, email });
+    }
+
     return found;
   } catch (error) {
     console.error("Error verifying participant:", error);
